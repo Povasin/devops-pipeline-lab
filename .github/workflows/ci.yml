@@ -1,0 +1,31 @@
+name: CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Syntax and tests
+        run: |
+          node --check app/catalog.mjs
+          mkdir -p reports
+          node --test --test-reporter=junit tests/catalog.test.mjs > reports/test-results.xml
+      - name: Save test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results
+          path: reports/test-results.xml

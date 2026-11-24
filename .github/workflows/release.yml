@@ -1,0 +1,106 @@
+name: Release candidate
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate stable tag on main
+        shell: bash
+        run: |
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$GITHUB_REF_NAME" =~ $pattern ]]
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: node --test tests/catalog.test.mjs
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Build and check the local image
+        shell: bash
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE_TAG="$IMAGE_NAME:${GITHUB_REF_NAME#v}"
+          {
+            echo "IMAGE_NAME=$IMAGE_NAME"
+            echo "IMAGE_TAG=$IMAGE_TAG"
+          } >> "$GITHUB_ENV"
+          docker build --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label "org.opencontainers.image.version=${GITHUB_REF_NAME#v}" -t "$IMAGE_TAG" .
+          docker run -d --name catalog-build-check -p 127.0.0.1:8080:8080 "$IMAGE_TAG"
+          trap 'docker rm -f catalog-build-check >/dev/null' EXIT
+          curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/health
+          node scripts/smoke.mjs
+      - name: Push image and record its digest
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE_TAG" | tee push.log
+          DIGEST=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' push.log | tail -n1)
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          IMAGE_REF="$IMAGE_NAME@$DIGEST"
+          echo "image=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          jq -n --arg version "${GITHUB_REF_NAME#v}" --arg commit "$(git rev-parse HEAD)" \
+            --arg tag "$IMAGE_TAG" --arg image "$IMAGE_REF" \
+            '{version: $version, commit: $commit, image_tag: $tag, image: $image}' > release.json
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-manifest
+          path: release.json
+          if-no-files-found: error
+
+  staging-check:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE_REF: ${{ needs.publish.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Rehearse deployment of the published image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker compose pull
+          docker compose up -d --no-build --wait --wait-timeout 45
+          node scripts/smoke.mjs
+      - name: Stop deployment rehearsal
+        if: ${{ always() }}
+        run: docker compose down
